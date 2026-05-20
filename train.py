@@ -20,14 +20,32 @@ CONFIG = {
 print("🔧 Device:", "cuda" if torch.cuda.is_available() else "cpu")
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, path, root):
+    """
+    Dataset for COCO-style JSONL annotations (e.g. URPC 2020).
+
+    Expected JSONL format per line:
+    {
+        "file_name": "train/images/00001.jpg",
+        "caption": "holothurian echinus scallop starfish .",
+        "annotations": [
+            {"bbox": [x, y, w, h], "category_name": "holothurian"},
+            ...
+        ]
+    }
+
+    bbox format: COCO standard [x, y, width, height] with (x,y) = top-left corner.
+    Set bbox_format="xyxy" if annotations already use [x1, y1, x2, y2].
+    """
+
+    def __init__(self, path, root, bbox_format="xywh"):
         self.data = [json.loads(x) for x in open(path)]
         self.root = root
+        self.bbox_format = bbox_format
 
         self.t = T.Compose([
             T.Resize((800, 800)),
             T.ToTensor(),
-            T.Normalize([0.5]*3, [0.5]*3)
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
 
     def __len__(self):
@@ -43,12 +61,29 @@ class Dataset(torch.utils.data.Dataset):
         boxes, labels = [], []
 
         for a in d.get("annotations", []):
-            x1, y1, x2, y2 = a["bbox"]
-            boxes.append([x1/w, y1/h, x2/w, y2/h])
+            if self.bbox_format == "xywh":
+                # COCO standard: [x, y, width, height] -> normalize to [x1, y1, x2, y2]
+                bx, by, bw, bh = a["bbox"]
+                x1, y1, x2, y2 = bx, by, bx + bw, by + bh
+            else:
+                # Already [x1, y1, x2, y2]
+                x1, y1, x2, y2 = a["bbox"]
+
+            # Normalize to [0, 1] and clamp
+            box = [
+                max(0.0, min(1.0, x1 / w)),
+                max(0.0, min(1.0, y1 / h)),
+                max(0.0, min(1.0, x2 / w)),
+                max(0.0, min(1.0, y2 / h)),
+            ]
+            # Skip degenerate boxes
+            if box[2] <= box[0] or box[3] <= box[1]:
+                continue
+            boxes.append(box)
             labels.append(a["category_name"])
 
         return img, {
-            "boxes": torch.tensor(boxes) if boxes else torch.zeros((0, 4)),
+            "boxes": torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros((0, 4)),
             "labels": labels,
             "caption": d.get("caption", "")
         }, d.get("caption", "")
@@ -71,6 +106,8 @@ def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", required=True)
     parser.add_argument("--output-dir", default="./outputs")
+    parser.add_argument("--bbox-format", default="xywh", choices=["xywh", "xyxy"],
+                        help="Bounding box format in annotations. COCO uses xywh.")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -79,7 +116,8 @@ def train():
 
     ds = Dataset(
         os.path.join(args.data_path, "train/annotations/train.jsonl"),
-        args.data_path
+        args.data_path,
+        bbox_format=args.bbox_format,
     )
 
     dl = DataLoader(
@@ -111,16 +149,17 @@ def train():
             try:
                 tokenized = tokenizer(
                     caps,
-                    padding=True,
+                    padding="longest",
                     truncation=True,
-                    return_tensors="pt"
+                    max_length=256,
+                    return_tensors="pt",
                 ).to(device)
 
                 out = model(imgs, captions=caps)
                 loss_dict = loss_fn(out, tgts, tokenized, tokenizer)
                 loss = loss_dict["loss"]
 
-                if torch.isnan(loss):
+                if torch.isnan(loss) or torch.isinf(loss):
                     skipped_steps += 1
                     continue
 
@@ -130,6 +169,7 @@ def train():
 
             opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
             opt.step()
 
             loss_items = {k: v.item() if torch.is_tensor(v) else v 

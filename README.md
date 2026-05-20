@@ -366,6 +366,97 @@ If you find our work helpful for your research, please consider citing the follo
 }
 ```
 
+---
+
+## Fine-Tuning Loss Function for COCO-Style Datasets (e.g. URPC 2020)
+
+### First-Principles Analysis & Critique
+
+The original `groundingdino_loss.py` had several fundamental issues that made it incompatible with properly training on COCO-style datasets like URPC 2020. Below is the analysis and the corrections applied.
+
+---
+
+### Issue 1: Classification Target Construction Was Fundamentally Broken
+
+**Problem:** The original code set `target_logits[b, row] = 1.0`, which activated ALL 256 token positions for matched queries.
+
+**Why this is wrong from first principles:** GroundingDINO's classification head outputs `pred_logits` of shape `[B, num_queries, max_text_len]`. Each value represents the affinity between a query and a specific text token. A query detecting "holothurian" should only have high logits at the token positions where "holothurian" appears (e.g., tokens `['ho', '##lot', '##hur', '##ian']`), NOT at tokens for "scallop" or "starfish". Setting all 256 positions to 1.0 destroys the text-grounding signal entirely — the model cannot learn which text phrase corresponds to which detected object.
+
+**Fix:** Build a **positive map** per GT object using the tokenizer's `char_to_token()` method to map class label character spans to token positions. Only those positions are set to 1.0 (then normalized).
+
+---
+
+### Issue 2: COCO BBox Format Mismatch
+
+**Problem:** The dataset loader unpacked `a["bbox"]` as `[x1, y1, x2, y2]`, but COCO standard format is `[x, y, width, height]` where (x, y) is the top-left corner.
+
+**Why this matters:** Interpreting width as x2 and height as y2 produces completely wrong normalized boxes. For example, a small 50x50 object at position (100, 100) would be interpreted as a box from (100, 100) to (50, 50) — a degenerate box with negative area. The `generalized_box_iou` assertion `(boxes[:, 2:] >= boxes[:, :2]).all()` would fail, or matching would produce nonsensical results.
+
+**Fix:** Added `bbox_format` parameter (default `"xywh"`) to the Dataset class. When `xywh`, converts via `x2 = x + w, y2 = y + h`. Also added degenerate box filtering.
+
+---
+
+### Issue 3: Hungarian Matching Lacked Class-Aware Cost
+
+**Problem:** The classification cost was `cls_cost = -sigmoid(pred_logits).max(-1)[0]` — just an objectness score (highest token probability regardless of class). This means a query predicting "scallop" could cheaply match to a "starfish" GT.
+
+**Why this is wrong:** In a multi-class dataset like URPC 2020 (holothurian, echinus, scallop, starfish), the matching must consider whether a query's predicted class aligns with the GT object's class. Without this, the matching is class-agnostic and the classification loss receives contradictory supervision.
+
+**Fix:** The classification cost is now computed as `-(pred_probs @ positive_map.T)`, which measures how well each query's token predictions align with each GT object's class tokens. This produces a proper `[num_queries, num_gt]` cost matrix.
+
+---
+
+### Issue 4: Loss Normalization Was Per-Batch-Element Instead of Per-Object
+
+**Problem:** BBox and GIoU losses were averaged per batch element (`total_loss / count` where count = number of batch elements with matches), not per matched object. A batch element with 10 objects contributed the same loss weight as one with 1 object.
+
+**Fix:** Losses are now accumulated with `reduction="sum"` and divided by total number of matched objects across the batch. This matches the standard DETR loss normalization.
+
+---
+
+### Issue 5: Auxiliary Loss Recursive Call Had Missing Arguments
+
+**Problem:** `self.forward(aux, targets)` was missing `tokenized` and `tokenizer` arguments, which would cause a TypeError.
+
+**Fix:** Passes all arguments: `self.forward(aux, targets, tokenized, tokenizer)`.
+
+---
+
+### Issue 6: Image Normalization Used Non-Standard Values
+
+**Problem:** The transform used `Normalize([0.5]*3, [0.5]*3)` but GroundingDINO's Swin Transformer backbone was pretrained with ImageNet normalization.
+
+**Fix:** Changed to `Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])`.
+
+---
+
+### Issue 7: No Gradient Clipping
+
+**Problem:** DETR-style models are known to have unstable gradients, especially early in training. Without gradient clipping, large gradients from the focal loss (especially with 900 queries and 256 token dimensions) can cause training divergence.
+
+**Fix:** Added `clip_grad_norm_(model.parameters(), max_norm=0.1)` matching the original DETR/GroundingDINO training recipe.
+
+---
+
+### Usage
+
+```bash
+# URPC 2020 with COCO-style [x, y, w, h] annotations (default)
+python train.py --data-path /path/to/urpc2020 --bbox-format xywh
+
+# If your annotations already use [x1, y1, x2, y2]
+python train.py --data-path /path/to/urpc2020 --bbox-format xyxy
+```
+
+### Running Tests
+
+```bash
+conda activate groundingdino_py38
+python test_loss.py
+```
+
+Validates: positive map construction, gradient flow, empty target handling, Hungarian matching quality, and COCO bbox conversion.
+
 
 
 
