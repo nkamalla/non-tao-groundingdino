@@ -50,7 +50,7 @@ class GroundingDINOLoss(nn.Module):
         giou = generalized_box_iou(pred_boxes, gt_boxes)
         return (1 - torch.diag(giou)).mean()
 
-    def build_positive_maps(self, targets, tokenized, tokenizer):
+    def build_positive_maps(self, targets, tokenized, tokenizer, max_text_len=None):
         """
         Build per-sample positive maps linking each GT box to token positions
         in the caption via its class label.
@@ -62,7 +62,11 @@ class GroundingDINOLoss(nn.Module):
                          (used for matching cost computation)
         """
         B = len(targets)
-        max_text_len = tokenized["input_ids"].shape[1]
+        # Use model's output text dimension (pred_logits.shape[2]) if provided,
+        # otherwise fall back to tokenized length. The model pads/truncates text
+        # to max_text_len=256 internally, so positive maps must match that dim.
+        if max_text_len is None:
+            max_text_len = tokenized["input_ids"].shape[1]
         binary_maps = []
         norm_maps = []
 
@@ -194,7 +198,10 @@ class GroundingDINOLoss(nn.Module):
         # Build positive maps:
         #   binary_maps: 1.0 at positive positions (for focal loss targets)
         #   norm_maps: normalized per-row (for matching cost)
-        binary_maps, norm_maps = self.build_positive_maps(targets, tokenized, tokenizer)
+        # CRITICAL: use pred_logits.shape[2] as max_text_len so positive maps
+        # match the model's output dimension (model pads text to max_text_len=256)
+        model_text_dim = pred_logits.shape[2]
+        binary_maps, norm_maps = self.build_positive_maps(targets, tokenized, tokenizer, max_text_len=model_text_dim)
 
         # Hungarian matching uses normalized maps for fair class-cost comparison
         indices = self.Hungarian_matching(outputs, targets, norm_maps)
