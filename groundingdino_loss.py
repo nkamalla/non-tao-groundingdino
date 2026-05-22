@@ -55,14 +55,16 @@ class GroundingDINOLoss(nn.Module):
         Build per-sample positive maps linking each GT box to token positions
         in the caption via its class label.
 
-        Returns:
-            List of tensors, one per batch element.
-            Each tensor has shape [num_gt_boxes, max_text_len].
-            Values are normalized so each row sums to 1 (or 0 if no match).
+        Returns two lists (one per batch element each):
+            binary_maps: [num_gt, max_text_len] with 1.0 at positive token positions
+                         (used as focal loss targets)
+            norm_maps:   [num_gt, max_text_len] normalized so each row sums to 1
+                         (used for matching cost computation)
         """
         B = len(targets)
         max_text_len = tokenized["input_ids"].shape[1]
-        positive_maps = []
+        binary_maps = []
+        norm_maps = []
 
         for b in range(B):
             labels = targets[b].get("labels", [])
@@ -70,9 +72,9 @@ class GroundingDINOLoss(nn.Module):
             num_gt = len(labels)
 
             if num_gt == 0:
-                positive_maps.append(
-                    torch.zeros((0, max_text_len), device=tokenized["input_ids"].device)
-                )
+                empty = torch.zeros((0, max_text_len), device=tokenized["input_ids"].device)
+                binary_maps.append(empty)
+                norm_maps.append(empty)
                 continue
 
             pos_map = torch.zeros(
@@ -114,16 +116,20 @@ class GroundingDINOLoss(nn.Module):
                 if beg_tok is not None and end_tok is not None:
                     pos_map[j, beg_tok : end_tok + 1] = 1.0
 
-            # Normalize each row to sum to 1 (soft target)
+            # Binary map: 1.0 at positive positions (for focal loss targets)
+            binary_maps.append(pos_map.clone())
+
+            # Normalized map: each row sums to 1 (for matching cost weighting)
             row_sums = pos_map.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-            pos_map = pos_map / row_sums
-            positive_maps.append(pos_map)
+            norm_maps.append(pos_map / row_sums)
 
-        return positive_maps
+        return binary_maps, norm_maps
 
-    def Hungarian_matching(self, outputs, targets, positive_maps):
+    def Hungarian_matching(self, outputs, targets, norm_maps):
         """
         Bipartite matching using combined bbox + GIoU + class-aware costs.
+        Uses normalized positive maps for the classification cost so that
+        multi-token words don't dominate single-token words.
         """
         device = outputs["pred_boxes"].device
         pred_boxes = outputs["pred_boxes"]
@@ -149,15 +155,12 @@ class GroundingDINOLoss(nn.Module):
             # GIoU cost: [num_queries, num_gt]
             giou_cost = -generalized_box_iou(pred_boxes_b, gt_boxes)
 
-            # Class-aware cost using positive maps
-            # pred_logits[b]: [num_queries, max_text_len]
-            # positive_maps[b]: [num_gt, max_text_len]
+            # Class-aware cost using NORMALIZED positive maps
+            # This ensures fair comparison across classes with different token counts
             pred_probs = torch.sigmoid(pred_logits[b])  # [num_queries, max_text_len]
-            pos_map_b = positive_maps[b]  # [num_gt, max_text_len]
+            pos_map_b = norm_maps[b]  # [num_gt, max_text_len] (normalized)
 
-            # For each (query, gt) pair, compute mean predicted prob at gt's token positions
-            # This gives a [num_queries, num_gt] class cost
-            # matmul: [num_queries, max_text_len] @ [max_text_len, num_gt] -> [num_queries, num_gt]
+            # matmul: [num_queries, T] @ [T, num_gt] -> [num_queries, num_gt]
             cls_cost = -(pred_probs @ pos_map_b.t())
 
             # Combined cost
@@ -188,23 +191,35 @@ class GroundingDINOLoss(nn.Module):
         pred_logits = outputs["pred_logits"]
         B = pred_boxes.shape[0]
 
-        # Build positive maps: maps each GT box to its token positions in the caption
-        positive_maps = self.build_positive_maps(targets, tokenized, tokenizer)
+        # Build positive maps:
+        #   binary_maps: 1.0 at positive positions (for focal loss targets)
+        #   norm_maps: normalized per-row (for matching cost)
+        binary_maps, norm_maps = self.build_positive_maps(targets, tokenized, tokenizer)
 
-        # Hungarian matching with class-aware costs
-        indices = self.Hungarian_matching(outputs, targets, positive_maps)
+        # Hungarian matching uses normalized maps for fair class-cost comparison
+        indices = self.Hungarian_matching(outputs, targets, norm_maps)
 
         # --- Classification loss (token-level focal loss) ---
-        # Build per-query targets using positive maps from matched GT
+        # CRITICAL: use BINARY targets (1.0 at positive token positions).
+        # Using normalized soft targets (e.g. 0.25) causes NaN because:
+        # 1) BCE optimal point becomes p=0.25 instead of p=1.0, conflicting with matching
+        # 2) Focal modulation (1-p_t)^gamma amplifies loss at wrong operating point
+        # 3) The resulting gradient instability causes parameter explosion → NaN
         target_logits = torch.zeros_like(pred_logits)  # [B, Q, T]
 
+        num_positive_tokens = 0  # Track total positive elements for normalization
         for b in range(B):
             row, col = indices[b]
             if len(row) == 0:
                 continue
-            # For each matched query, assign the positive map of its matched GT
-            # positive_maps[b][col]: [num_matched, max_text_len]
-            target_logits[b, row] = positive_maps[b][col]
+            # Assign BINARY positive map as target (1.0 at class token positions)
+            target_logits[b, row] = binary_maps[b][col]
+            num_positive_tokens += binary_maps[b][col].sum().item()
+
+        # Normalize by number of positive TOKEN positions (not just num_boxes).
+        # This prevents the loss from scaling with text length.
+        # E.g., 5 objects with avg 3 tokens each = 15 positive elements.
+        num_pos = max(num_positive_tokens, 1.0)
 
         cls_loss = sigmoid_focal_loss(
             pred_logits,
@@ -212,10 +227,7 @@ class GroundingDINOLoss(nn.Module):
             alpha=self.focal_alpha,
             gamma=self.focal_gamma,
             reduction="sum",
-        )
-        # Normalize by total number of matched GT objects
-        num_boxes = max(sum(len(indices[b][0]) for b in range(B)), 1)
-        cls_loss = cls_loss / num_boxes
+        ) / num_pos
 
         # --- BBox + GIoU losses ---
         total_bbox_loss = torch.tensor(0.0, device=device)

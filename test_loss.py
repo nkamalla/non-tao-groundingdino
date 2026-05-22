@@ -41,23 +41,28 @@ def test_positive_map_construction():
 
     tokenized = make_tokenized(tokenizer, [caption])
 
-    positive_maps = loss_fn.build_positive_maps(targets, tokenized, tokenizer)
-    pos_map = positive_maps[0]
+    binary_maps, norm_maps = loss_fn.build_positive_maps(targets, tokenized, tokenizer)
+    bin_map = binary_maps[0]
+    nrm_map = norm_maps[0]
 
     print(f"Caption: '{caption}'")
     print(f"Labels: {targets[0]['labels']}")
-    print(f"Positive map shape: {pos_map.shape}")
+    print(f"Binary map shape: {bin_map.shape}")
     print(f"Tokens: {tokenizer.convert_ids_to_tokens(tokenized['input_ids'][0])}")
 
-    # Verify each row sums to ~1
-    row_sums = pos_map.sum(dim=-1)
-    print(f"Row sums (should be ~1.0): {row_sums}")
+    # Verify binary map has 1.0 at positive positions
+    assert bin_map.max() == 1.0, "Binary map should have max value 1.0"
+    print(f"Binary map row sums (num tokens per class): {bin_map.sum(dim=-1).tolist()}")
+
+    # Verify normalized map rows sum to ~1
+    row_sums = nrm_map.sum(dim=-1)
+    print(f"Norm map row sums (should be ~1.0): {row_sums}")
     assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5), \
-        f"Row sums should be 1.0, got {row_sums}"
+        f"Norm row sums should be 1.0, got {row_sums}"
 
     # Verify 'holothurian' maps to correct tokens (NOT 'scallop' tokens)
-    holo_tokens = pos_map[0].nonzero(as_tuple=True)[0]
-    scallop_tokens = pos_map[1].nonzero(as_tuple=True)[0]
+    holo_tokens = bin_map[0].nonzero(as_tuple=True)[0]
+    scallop_tokens = bin_map[1].nonzero(as_tuple=True)[0]
     print(f"'holothurian' token positions: {holo_tokens.tolist()}")
     print(f"'scallop' token positions: {scallop_tokens.tolist()}")
 
@@ -227,14 +232,14 @@ def test_hungarian_matching_quality():
 
     # Also set corresponding logits high for correct class tokens
     pred_logits = torch.zeros(1, Q, T) - 5.0  # All low
-    pos_maps = loss_fn.build_positive_maps(
+    binary_maps, norm_maps = loss_fn.build_positive_maps(
         [{"boxes": gt_boxes, "labels": ["holothurian", "scallop"], "caption": caption}],
         tokenized, tokenizer
     )
     # Make query 5 have high logits for 'holothurian' tokens
-    pred_logits[0, 5] = 5.0 * pos_maps[0][0]
+    pred_logits[0, 5] = 5.0 * binary_maps[0][0]
     # Make query 10 have high logits for 'scallop' tokens
-    pred_logits[0, 10] = 5.0 * pos_maps[0][1]
+    pred_logits[0, 10] = 5.0 * binary_maps[0][1]
 
     outputs = {"pred_logits": pred_logits, "pred_boxes": pred_boxes}
     targets = [{
@@ -243,7 +248,7 @@ def test_hungarian_matching_quality():
         "caption": caption,
     }]
 
-    indices = loss_fn.Hungarian_matching(outputs, targets, pos_maps)
+    indices = loss_fn.Hungarian_matching(outputs, targets, norm_maps)
     row, col = indices[0]
 
     print(f"Matched pred indices: {row}")
@@ -311,6 +316,77 @@ def test_coco_bbox_format():
     print("✅ PASSED: COCO bbox format correctly converted\n")
 
 
+def test_loss_scale_and_nan_stability():
+    """
+    Test that simulates multiple training steps to ensure no NaN.
+    This specifically verifies the fix for the soft-target NaN issue.
+    """
+    print("=" * 60)
+    print("TEST 7: Multi-Step NaN Stability (Text-Alignment Loss)")
+    print("=" * 60)
+
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    loss_fn = GroundingDINOLoss()
+
+    B, Q = 2, 900
+    caption1 = "holothurian echinus scallop starfish ."
+    caption2 = "echinus starfish ."
+    captions = [caption1, caption2]
+
+    tokenized = make_tokenized(tokenizer, captions)
+    T = tokenized["input_ids"].shape[1]
+
+    # Simulate a simple "model" with parameters
+    logits_param = torch.randn(B, Q, T) * 2.0
+    logits_param = torch.nn.Parameter(logits_param)
+    boxes_param = torch.nn.Parameter(torch.randn(B, Q, 4))
+
+    optimizer = torch.optim.AdamW([logits_param, boxes_param], lr=1e-3)
+
+    targets = [
+        {
+            "boxes": torch.tensor([[0.1, 0.2, 0.4, 0.5], [0.5, 0.5, 0.8, 0.9]]),
+            "labels": ["holothurian", "scallop"],
+            "caption": caption1,
+        },
+        {
+            "boxes": torch.tensor([[0.2, 0.3, 0.6, 0.7]]),
+            "labels": ["starfish"],
+            "caption": caption2,
+        },
+    ]
+
+    nan_occurred = False
+    losses = []
+    for step in range(50):
+        optimizer.zero_grad()
+        outputs = {
+            "pred_logits": logits_param,
+            "pred_boxes": boxes_param.sigmoid(),
+        }
+        loss_dict = loss_fn(outputs, targets, tokenized, tokenizer)
+        loss = loss_dict["loss"]
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"  ❌ NaN/Inf at step {step}! loss={loss.item()}")
+            nan_occurred = True
+            break
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_([logits_param, boxes_param], max_norm=0.1)
+        optimizer.step()
+        losses.append(loss.item())
+
+    if not nan_occurred:
+        print(f"  50 steps completed without NaN")
+        print(f"  Loss: {losses[0]:.4f} → {losses[-1]:.4f} (should decrease)")
+        print(f"  Cls loss at step 0: {loss_fn(outputs, targets, tokenized, tokenizer)['cls_loss'].item():.4f}")
+        assert losses[-1] < losses[0], "Loss should decrease over training steps"
+
+    assert not nan_occurred, "NaN occurred during training!"
+    print("✅ PASSED: No NaN in 50 steps of text-alignment training\n")
+
+
 if __name__ == "__main__":
     test_positive_map_construction()
     test_loss_gradient_flow()
@@ -318,6 +394,7 @@ if __name__ == "__main__":
     test_all_empty_targets()
     test_hungarian_matching_quality()
     test_coco_bbox_format()
+    test_loss_scale_and_nan_stability()
     print("\n" + "=" * 60)
     print("ALL TESTS PASSED ✅")
     print("=" * 60)
